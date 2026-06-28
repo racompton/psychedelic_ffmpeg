@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-import argparse, random, subprocess, json, shlex
+import argparse, random, subprocess, json, shlex, math
+from pathlib import Path
 
 EFFECTS = [
     "hue=h=360*t/12:s=2.2,eq=contrast=1.25:saturation=2.4",
@@ -20,75 +21,101 @@ def get_duration(path):
         "ffprobe", "-v", "error",
         "-show_entries", "format=duration",
         "-of", "json",
-        path
+        str(path)
     ])
     return float(json.loads(out)["format"]["duration"])
 
-def esc(expr):
-    return expr.replace(",", "\\,")
+def timestamp_name(seconds):
+    seconds = int(seconds)
+    h = seconds // 3600
+    m = (seconds % 3600) // 60
+    s = seconds % 60
+    return f"{h:02d}h{m:02d}m{s:02d}s"
 
-def main():
-    p = argparse.ArgumentParser()
-    p.add_argument("input")
-    p.add_argument("output")
-    p.add_argument("--min", type=int, default=60, help="minimum effect duration seconds")
-    p.add_argument("--max", type=int, default=180, help="maximum effect duration seconds")
-    p.add_argument("--fade", type=int, default=8, help="fade in/out duration seconds")
-    p.add_argument("--seed", type=int, default=None)
-    args = p.parse_args()
+def process_clip(input_file, output_file, start, duration, fade):
+    effect = random.choice(EFFECTS)
+    fade = min(fade, duration / 3)
 
-    if args.seed is not None:
-        random.seed(args.seed)
+    weight = (
+        f"if(lt(t,{fade}),t/{fade},"
+        f"if(gt(t,{duration - fade}),({duration}-t)/{fade},1))"
+    )
 
-    total = get_duration(args.input)
-    t = 0
-    parts = []
-    filters = []
-
-    i = 0
-    while t < total:
-        dur = random.randint(args.min, args.max)
-        end = min(t + dur, total)
-        segdur = end - t
-        fade = min(args.fade, segdur / 3)
-
-        effect = random.choice(EFFECTS)
-
-        weight = (
-            f"if(lt(T,{fade}),T/{fade},"
-            f"if(gt(T,{segdur - fade}),({segdur}-T)/{fade},1))"
-        )
-
-        filters.append(
-            f"[0:v]trim=start={t}:end={end},setpts=PTS-STARTPTS,format=rgba[base{i}];"
-            f"[0:v]trim=start={t}:end={end},setpts=PTS-STARTPTS,{effect},format=rgba[fx{i}];"
-            f"[base{i}][fx{i}]blend=all_expr='A*(1-({esc(weight)}))+B*({esc(weight)})',format=yuv420p[v{i}]"
-        )
-
-        parts.append(f"[v{i}]")
-        t = end
-        i += 1
-
-    concat = "".join(parts) + f"concat=n={i}:v=1:a=0[vout]"
-    filter_complex = ";".join(filters + [concat])
+    filter_complex = (
+        f"[0:v]split=2[base][fx];"
+        f"[fx]{effect},format=rgba[fxout];"
+        f"[base]format=rgba[baseout];"
+        f"[baseout][fxout]"
+        f"blend=all_expr='A*(1-({weight}))+B*({weight})',"
+        f"format=yuv420p[vout]"
+    )
 
     cmd = [
         "ffmpeg", "-y",
-        "-i", args.input,
+        "-ss", str(start),
+        "-t", str(duration),
+        "-i", str(input_file),
         "-filter_complex", filter_complex,
         "-map", "[vout]",
         "-map", "0:a?",
         "-c:v", "libx264",
         "-preset", "medium",
         "-crf", "18",
-        "-c:a", "copy",
+        "-c:a", "aac",
+        "-b:a", "192k",
         "-movflags", "+faststart",
-        args.output
+        str(output_file)
     ]
 
     print("Running:")
     print(" ".join(shlex.quote(x) for x in cmd))
     subprocess.run(cmd, check=True)
+
+def main():
+    p = argparse.ArgumentParser()
+    p.add_argument("input_file")
+    p.add_argument("output_dir")
+    p.add_argument("--clip-length", type=int, default=60)
+    p.add_argument("--fade", type=int, default=8)
+    p.add_argument("--seed", type=int, default=None)
+    p.add_argument("--include-partial", action="store_true")
+    args = p.parse_args()
+
+    if args.seed is not None:
+        random.seed(args.seed)
+
+    input_file = Path(args.input_file)
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    duration = get_duration(input_file)
+    base_name = input_file.stem
+
+    full_chunks = int(duration // args.clip_length)
+    starts = [i * args.clip_length for i in range(full_chunks)]
+
+    if args.include_partial:
+        remainder = duration % args.clip_length
+        if remainder > 5:
+            starts.append(full_chunks * args.clip_length)
+
+    random.shuffle(starts)
+
+    for start in starts:
+        actual_duration = min(args.clip_length, duration - start)
+        ts = timestamp_name(start)
+        output_file = output_dir / f"{base_name}_{ts}_psychedelic.mp4"
+
+        print(f"\nProcessing clip starting at {ts}")
+        process_clip(
+            input_file=input_file,
+            output_file=output_file,
+            start=start,
+            duration=actual_duration,
+            fade=args.fade,
+        )
+
+    print("\nDone.")
 
 if __name__ == "__main__":
     main()
